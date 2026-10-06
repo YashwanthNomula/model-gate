@@ -1,0 +1,39 @@
+{
+  "gates": [
+    "files",
+    "schema",
+    "metrics",
+    "latency",
+    "size",
+    "contract"
+  ],
+  "files": {
+    "required": [
+      "manifest.json",
+      "model.py",
+      "schema.json",
+      "metrics.json",
+      "model.bin"
+    ]
+  },
+  "schema": {
+    "max_missing_rate": 0.01
+  },
+  "metrics": {
+    "accuracy": 0.9,
+    "f1": 0.8,
+    "auc": 0.9
+  },
+  "latency": {
+    "n_calls": 10,
+    "batch": 100,
+    "p95_ms": 50.0
+  },
+  "size": {
+    "file": "model.bin",
+    "max_bytes": 65536
+  },
+  "contract": {
+    "n_rows": 50
+  }
+}
