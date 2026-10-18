@@ -9,9 +9,12 @@ import sys
 
 from modelgate import __version__
 from modelgate import demo
+from modelgate.baseline import BaselineError, gate_regression, load_metrics_snapshot
 from modelgate.gates import (
     GATE_DESCRIPTIONS,
+    GateResult,
     exit_code,
+    resolve_overrides,
     run_gates,
 )
 from modelgate.report import render_html, render_json, render_text
@@ -35,6 +38,21 @@ def cmd_gates(_args):
     return 0
 
 
+def _parse_cli_overrides(pairs):
+    """Parse --override NAME=reason pairs into (name, reason) tuples."""
+    out = []
+    for pair in pairs or []:
+        if "=" not in pair:
+            raise ValueError(
+                f"'{pair}' — expected --override GATE=reason (reason is required)"
+            )
+        name, reason = pair.split("=", 1)
+        if not name.strip():
+            raise ValueError(f"'{pair}' — override names a gate, e.g. --override metrics='...'")
+        out.append((name.strip(), reason.strip()))
+    return out
+
+
 def cmd_check(args):
     if not os.path.isdir(args.artifact):
         print(f"error: artifact directory not found: {args.artifact}", file=sys.stderr)
@@ -52,10 +70,38 @@ def cmd_check(args):
         print(f"error: invalid JSON in {args.config}: {exc}", file=sys.stderr)
         return 2
 
-    results = run_gates(cfg, args.artifact, args.data, only=args.only)
+    try:
+        overrides = resolve_overrides(cfg, _parse_cli_overrides(args.override))
+    except ValueError as exc:
+        print(f"error: invalid override: {exc}", file=sys.stderr)
+        return 2
+
+    # "regression" is not in run_gates' table (it needs a --baseline file),
+    # so keep it out of the `only` filter and append the real result below.
+    want_regression = args.only is not None and "regression" in args.only
+    only = [g for g in args.only if g != "regression"] if args.only else args.only
+    results = run_gates(cfg, args.artifact, args.data,
+                        only=only, overrides=overrides)
+
+    if args.baseline and (args.only is None or want_regression):
+        results.append(
+            gate_regression(cfg, args.artifact, args.data, args.baseline)
+        )
+    elif want_regression:
+        results.append(GateResult(
+            "regression", "fail",
+            "regression gate needs --baseline PRIOR-REPORT.json", 0.0))
+
+    snapshot = None
+    if args.format == "json":
+        try:
+            snapshot = load_metrics_snapshot(args.artifact)
+        except BaselineError:
+            snapshot = None  # metrics gate already reports the problem
 
     if args.format == "json":
-        out = render_json(results, os.path.basename(args.artifact.rstrip("/")))
+        out = render_json(results, os.path.basename(args.artifact.rstrip("/")),
+                          metrics=snapshot)
     elif args.format == "html":
         out = render_html(results, os.path.basename(args.artifact.rstrip("/")))
     else:
@@ -93,6 +139,15 @@ def build_parser():
     pc.add_argument("--data", required=True, help="validation sample CSV")
     pc.add_argument("--only", nargs="*", default=None,
                     help="run only these gates (default: all in config)")
+    pc.add_argument("--override", action="append", default=[],
+                    metavar="GATE=reason",
+                    help="waive a gate for this run; a non-empty justification "
+                         "is required and recorded in the report. Repeatable.")
+    pc.add_argument("--baseline", default=None, metavar="PRIOR-REPORT.json",
+                    help="compare metrics against a prior `check --format json` "
+                         "report and fail when any metric regresses beyond its "
+                         "configured tolerance (see the 'regression' config "
+                         "block). Adds a 'regression' gate to the results.")
     pc.add_argument("--format", choices=["text", "json", "html"], default="text")
     pc.add_argument("-o", "--output", default=None, help="write report to file")
     pc.set_defaults(func=cmd_check)

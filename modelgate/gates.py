@@ -16,6 +16,10 @@ from dataclasses import dataclass
 
 PASS, FAIL, WARN, SKIP = "pass", "fail", "warn", "skip"
 
+HIGHER_IS_BETTER = "higher_is_better"
+LOWER_IS_BETTER = "lower_is_better"
+VALID_DIRECTIONS = frozenset({HIGHER_IS_BETTER, LOWER_IS_BETTER})
+
 GATE_DESCRIPTIONS = {
     "files": "Required artifact files exist",
     "schema": "Sample data matches the declared schema (fields, types, missing rate)",
@@ -23,6 +27,7 @@ GATE_DESCRIPTIONS = {
     "latency": "predict() p95 latency stays under budget on repeated batches",
     "size": "Artifact file fits within the size limit",
     "contract": "predict() output length and labels satisfy the serving contract",
+    "regression": "Metrics do not regress beyond tolerance vs a prior JSON report (needs --baseline)",
 }
 
 DEFAULT_FILES = ["manifest.json", "model.py", "schema.json", "metrics.json"]
@@ -172,6 +177,35 @@ def gate_schema(cfg, artifact, data_path):
     )
 
 
+def _parse_metric_spec(name, spec):
+    """Parse one metric gate entry into (threshold, direction).
+
+    Accepts a bare number (backwards-compatible, higher_is_better) or
+    {"threshold": <number>, "direction": "higher_is_better"|"lower_is_better"}.
+    Raises ValueError on anything else — callers fail the gate closed.
+    """
+    if isinstance(spec, bool):
+        raise ValueError(f"metric '{name}': threshold must be a number or a "
+                         "{'threshold', 'direction'} object")
+    if isinstance(spec, (int, float)):
+        return float(spec), HIGHER_IS_BETTER
+    if isinstance(spec, dict):
+        if "threshold" not in spec:
+            raise ValueError(f"metric '{name}': object form needs a 'threshold'")
+        threshold = spec["threshold"]
+        if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
+            raise ValueError(f"metric '{name}': threshold must be a number")
+        direction = spec.get("direction", HIGHER_IS_BETTER)
+        if direction not in VALID_DIRECTIONS:
+            raise ValueError(
+                f"metric '{name}': invalid direction '{direction}' "
+                "(expected 'higher_is_better' or 'lower_is_better')"
+            )
+        return float(threshold), direction
+    raise ValueError(f"metric '{name}': threshold must be a number or a "
+                     "{'threshold', 'direction'} object")
+
+
 def gate_metrics(cfg, artifact, data_path):
     t0 = _now()
     mcfg = dict(cfg.get("metrics", {}))
@@ -186,22 +220,40 @@ def gate_metrics(cfg, artifact, data_path):
     if not mcfg:
         return GateResult("metrics", SKIP, "no metric thresholds configured", _elapsed(t0))
 
-    missing = [k for k in mcfg if k not in metrics]
+    # Parse specs first: a malformed entry fails the gate closed, before any
+    # comparison runs.
+    try:
+        specs = {k: _parse_metric_spec(k, spec) for k, spec in mcfg.items()}
+    except ValueError as exc:
+        return GateResult("metrics", FAIL, str(exc), _elapsed(t0))
+
+    missing = [k for k in specs if k not in metrics]
     if missing:
         return GateResult(
             "metrics", FAIL, f"missing metrics: {', '.join(missing)}", _elapsed(t0)
         )
-    below = [
-        f"{k} {metrics[k]:.4g} < {mcfg[k]:.4g}"
-        for k in mcfg
-        if metrics[k] < mcfg[k]
-    ]
-    if below:
+    problems = []
+    for k, (threshold, direction) in specs.items():
+        value = metrics[k]
+        if direction == LOWER_IS_BETTER:
+            if value > threshold:
+                problems.append(
+                    f"above threshold: {k} {value:.4g} > {threshold:.4g} (lower is better)"
+                )
+        elif value < threshold:
+            problems.append(f"below threshold: {k} {value:.4g} < {threshold:.4g}")
+    if problems:
         return GateResult(
-            "metrics", FAIL, "below threshold: " + "; ".join(below), _elapsed(t0)
+            "metrics", FAIL, "; ".join(problems), _elapsed(t0)
         )
-    detail = ", ".join(f"{k} {metrics[k]:.4g} ≥ {mcfg[k]:.4g}" for k in mcfg)
-    return GateResult("metrics", PASS, detail, _elapsed(t0))
+    parts = []
+    for k, (threshold, direction) in specs.items():
+        value = metrics[k]
+        if direction == LOWER_IS_BETTER:
+            parts.append(f"{k} {value:.4g} ≤ {threshold:.4g} (lower is better)")
+        else:
+            parts.append(f"{k} {value:.4g} ≥ {threshold:.4g}")
+    return GateResult("metrics", PASS, ", ".join(parts), _elapsed(t0))
 
 
 def _load_model(artifact):
@@ -316,11 +368,27 @@ _GATES = {
 }
 
 
-def run_gates(cfg, artifact, data_path, only=None):
-    """Run the configured gates (or the `only` subset) and return GateResults."""
+def run_gates(cfg, artifact, data_path, only=None, overrides=None):
+    """Run the configured gates (or the `only` subset) and return GateResults.
+
+    Gates listed in `overrides` are waived: they are not executed and
+    return a skip result carrying the justification string, so the
+    waiver is recorded in every report format.
+    """
     wanted = list(only) if only is not None else list(cfg.get("gates", _GATES))
+    overrides = overrides or {}
     results = []
     for name in wanted:
+        if name in overrides:
+            results.append(
+                GateResult(
+                    name,
+                    SKIP,
+                    f"waived by override: {overrides[name]}",
+                    0.0,
+                )
+            )
+            continue
         fn = _GATES.get(name)
         if fn is None:
             results.append(
@@ -329,6 +397,24 @@ def run_gates(cfg, artifact, data_path, only=None):
             continue
         results.append(fn(cfg, artifact, data_path))
     return results
+
+
+def resolve_overrides(cfg, cli_overrides=None):
+    """Merge config `overrides` with CLI --override pairs (CLI wins per gate).
+
+    Each justification must be a non-empty string for a known gate.
+    Raises ValueError on anything else so a bad waiver fails closed.
+    """
+    merged = dict(cfg.get("overrides", {}) or {})
+    for name, reason in (cli_overrides or []):
+        merged[name] = reason
+    for name, reason in merged.items():
+        if name not in _GATES:
+            raise ValueError(f"override for unknown gate '{name}'")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError(f"override for gate '{name}' needs a non-empty justification")
+        merged[name] = reason.strip()
+    return merged
 
 
 def exit_code(results):

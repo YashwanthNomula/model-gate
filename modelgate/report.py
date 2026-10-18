@@ -40,16 +40,21 @@ def render_text(results, artifact_name):
     return "\n".join(lines)
 
 
-def render_dict(results, artifact_name):
-    return {
+def render_dict(results, artifact_name, metrics=None):
+    payload = {
         "artifact": artifact_name,
         "summary": {"total": len(results), **counts(results)},
         "gates": [r.to_dict() for r in results],
     }
+    if metrics is not None:
+        # Metrics snapshot: lets a later run use this report as a
+        # --baseline for regression comparison.
+        payload["metrics"] = metrics
+    return payload
 
 
-def render_json(results, artifact_name):
-    return json.dumps(render_dict(results, artifact_name), indent=2)
+def render_json(results, artifact_name, metrics=None):
+    return json.dumps(render_dict(results, artifact_name, metrics=metrics), indent=2)
 
 
 def render_html(results, artifact_name):

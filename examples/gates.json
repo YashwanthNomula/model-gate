@@ -22,7 +22,8 @@
   "metrics": {
     "accuracy": 0.9,
     "f1": 0.8,
-    "auc": 0.9
+    "auc": 0.9,
+    "loss": { "threshold": 0.5, "direction": "lower_is_better" }
   },
   "latency": {
     "n_calls": 10,

@@ -63,6 +63,7 @@ GATES_CONFIG = {
     "latency": {"n_calls": 10, "batch": 100, "p95_ms": 50.0},
     "size": {"file": "model.bin", "max_bytes": 65536},
     "contract": {"n_rows": 50},
+    "overrides": {},  # {"gate-name": "required justification"} — waived gates skip as SKIPPED
 }
 
 MERCHANTS = ["grocery", "gas", "travel", "electronics", "crypto", "other"]
