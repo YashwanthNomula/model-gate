@@ -14,6 +14,7 @@ from modelgate.gates import (
     GATE_DESCRIPTIONS,
     GateResult,
     exit_code,
+    parse_severities,
     resolve_overrides,
     run_gates,
 )
@@ -76,21 +77,33 @@ def cmd_check(args):
         print(f"error: invalid override: {exc}", file=sys.stderr)
         return 2
 
+    try:
+        severities = parse_severities(cfg)
+    except ValueError as exc:
+        print(f"error: invalid severity config: {exc}", file=sys.stderr)
+        return 2
+    if args.strict:
+        # Promote every warn-severity gate to error for this run.
+        severities = {}
+
     # "regression" is not in run_gates' table (it needs a --baseline file),
     # so keep it out of the `only` filter and append the real result below.
     want_regression = args.only is not None and "regression" in args.only
     only = [g for g in args.only if g != "regression"] if args.only else args.only
     results = run_gates(cfg, args.artifact, args.data,
-                        only=only, overrides=overrides)
+                        only=only, overrides=overrides, severities=severities)
 
     if args.baseline and (args.only is None or want_regression):
         results.append(
-            gate_regression(cfg, args.artifact, args.data, args.baseline)
+            gate_regression(cfg, args.artifact, args.data, args.baseline,
+                            severities=severities)
         )
     elif want_regression:
-        results.append(GateResult(
+        needs_baseline = GateResult(
             "regression", "fail",
-            "regression gate needs --baseline PRIOR-REPORT.json", 0.0))
+            "regression gate needs --baseline PRIOR-REPORT.json", 0.0,
+            severity=severities.get("regression", "error"))
+        results.append(needs_baseline)
 
     snapshot = None
     if args.format == "json":
@@ -148,6 +161,10 @@ def build_parser():
                          "report and fail when any metric regresses beyond its "
                          "configured tolerance (see the 'regression' config "
                          "block). Adds a 'regression' gate to the results.")
+    pc.add_argument("--strict", action="store_true",
+                    help="promote all warn-severity gates to error for this run: "
+                         "any warn-severity failure blocks the deployment (exit 1). "
+                         "A malformed severity block still fails closed.")
     pc.add_argument("--format", choices=["text", "json", "html"], default="text")
     pc.add_argument("-o", "--output", default=None, help="write report to file")
     pc.set_defaults(func=cmd_check)

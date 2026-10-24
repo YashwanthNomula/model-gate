@@ -27,7 +27,12 @@ import json
 import os
 from dataclasses import dataclass
 
-from modelgate.gates import GateResult, _parse_metric_spec
+from modelgate.gates import (
+    SEVERITY_ERROR,
+    GateResult,
+    _parse_metric_spec,
+    parse_severities,
+)
 
 
 class BaselineError(ValueError):
@@ -181,11 +186,19 @@ def compare_metrics(current, baseline, directions, tolerances, default_tolerance
     return comparisons
 
 
-def gate_regression(cfg, artifact, data_path, baseline_path):
-    """Run the baseline-regression gate against a prior JSON report."""
+def gate_regression(cfg, artifact, data_path, baseline_path, severities=None):
+    """Run the baseline-regression gate against a prior JSON report.
+
+    `severities` is the {gate: "error"|"warn"} map from parse_severities
+    (parsed from cfg when omitted); the result is stamped with the
+    regression gate's severity like every other gate.
+    """
     import time
 
     t0 = time.perf_counter()
+    if severities is None:
+        severities = parse_severities(cfg)
+    sev = severities.get("regression", SEVERITY_ERROR)
     try:
         current = load_metrics_snapshot(artifact)
         baseline = load_baseline_report(baseline_path)
@@ -200,6 +213,7 @@ def gate_regression(cfg, artifact, data_path, baseline_path):
             return GateResult(
                 "regression", "fail", str(exc),
                 (time.perf_counter() - t0) * 1000.0,
+                severity=sev,
             )
         directions = {name: direction for name, (_, direction) in specs.items()}
         comparisons = compare_metrics(
@@ -207,23 +221,28 @@ def gate_regression(cfg, artifact, data_path, baseline_path):
         )
     except BaselineError as exc:
         return GateResult(
-            "regression", "fail", str(exc), (time.perf_counter() - t0) * 1000.0
+            "regression", "fail", str(exc), (time.perf_counter() - t0) * 1000.0,
+            severity=sev,
         )
     errors = [c for c in comparisons if c.outcome == "error"]
     regressed = [c for c in comparisons if c.outcome == "regressed"]
     detail = "; ".join(c.detail() for c in comparisons) or "no metrics to compare"
     if errors:
         return GateResult(
-            "regression", "fail", detail, (time.perf_counter() - t0) * 1000.0
+            "regression", "fail", detail, (time.perf_counter() - t0) * 1000.0,
+            severity=sev,
         )
     if regressed:
         return GateResult(
-            "regression", "fail", detail, (time.perf_counter() - t0) * 1000.0
+            "regression", "fail", detail, (time.perf_counter() - t0) * 1000.0,
+            severity=sev,
         )
     if all(c.outcome == "skipped" for c in comparisons):
         return GateResult(
-            "regression", "warn", detail, (time.perf_counter() - t0) * 1000.0
+            "regression", "warn", detail, (time.perf_counter() - t0) * 1000.0,
+            severity=sev,
         )
     return GateResult(
-        "regression", "pass", detail, (time.perf_counter() - t0) * 1000.0
+        "regression", "pass", detail, (time.perf_counter() - t0) * 1000.0,
+        severity=sev,
     )

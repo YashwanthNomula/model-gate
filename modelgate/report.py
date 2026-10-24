@@ -15,15 +15,31 @@ def counts(results):
     return out
 
 
+def warnings(results):
+    """Results that need attention but do not block the deployment:
+    "warn"-status results, plus failed gates declared severity "warn"."""
+    return [r for r in results
+            if r.status == "warn"
+            or (r.status == "fail" and r.severity == "warn")]
+
+
+def blocking_failures(results):
+    """Failed results that block the deployment (fail-closed on severity)."""
+    return [r for r in results
+            if r.status == "fail" and r.severity != "warn"]
+
+
 def summary_line(results):
     c = counts(results)
     total = len(results)
     line = f"{c['pass']}/{total} passed"
     extras = []
-    if c["fail"]:
-        extras.append(f"{c['fail']} failed")
-    if c["warn"]:
-        extras.append(f"{c['warn']} warning")
+    n_failed = len(blocking_failures(results))
+    if n_failed:
+        extras.append(f"{n_failed} failed")
+    n_warn = len(warnings(results))
+    if n_warn:
+        extras.append(f"{n_warn} warning")
     if c["skip"]:
         extras.append(f"{c['skip']} skipped")
     if extras:
@@ -31,12 +47,24 @@ def summary_line(results):
     return line
 
 
+def _severity_note(r):
+    return " [severity: warn]" if r.status == "fail" and r.severity == "warn" else ""
+
+
 def render_text(results, artifact_name):
     lines = [f"model-gate  artifact: {artifact_name}", ""]
     for r in results:
         sym = SYMBOLS.get(r.status, "?")
-        lines.append(f"  {sym} {r.name:<10} {r.status:<4}  {r.detail}")
+        lines.append(f"  {sym} {r.name:<10} {r.status:<4}  {r.detail}{_severity_note(r)}")
     lines += ["", summary_line(results)]
+    warns = warnings(results)
+    if warns:
+        lines += ["", "WARNINGS — deployment proceeds, but these gates need attention:"]
+        for r in warns:
+            sym = "!" if r.status == "fail" else SYMBOLS.get(r.status, "?")
+            lines.append(
+                f"  {sym} {r.name:<10} {r.status:<4}  {r.detail}{_severity_note(r)}"
+            )
     return "\n".join(lines)
 
 
@@ -45,6 +73,7 @@ def render_dict(results, artifact_name, metrics=None):
         "artifact": artifact_name,
         "summary": {"total": len(results), **counts(results)},
         "gates": [r.to_dict() for r in results],
+        "warnings": [r.to_dict() for r in warnings(results)],
     }
     if metrics is not None:
         # Metrics snapshot: lets a later run use this report as a
@@ -62,6 +91,8 @@ def render_html(results, artifact_name):
     rows = []
     for r in results:
         cls = r.status
+        detail = _html.escape(r.detail) + (
+            " <em>[severity: warn]</em>" if _severity_note(r) else "")
         rows.append(
             "<tr class='%s'><td>%s</td><td>%s</td>"
             "<td>%s</td><td>%.1f</td></tr>"
@@ -69,12 +100,16 @@ def render_html(results, artifact_name):
                 cls,
                 SYMBOLS.get(r.status, "?"),
                 _html.escape(r.name),
-                _html.escape(r.detail),
+                detail,
                 r.duration_ms,
             )
         )
-    overall = "PASS" if all(r.status != "fail" for r in results) else "FAIL"
-    banner = "ok" if overall == "PASS" else "bad"
+    if blocking_failures(results):
+        overall, banner = "FAIL", "bad"
+    elif warnings(results):
+        overall, banner = "PASS (with warnings)", "warn"
+    else:
+        overall, banner = "PASS", "ok"
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -86,6 +121,7 @@ body {{ font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
 .banner {{ padding: 1rem 1.5rem; border-radius: 8px; margin-bottom: 1.5rem; }}
 .banner.ok {{ background: #e6f6ec; border: 1px solid #34a853; }}
 .banner.bad {{ background: #fdecea; border: 1px solid #d93025; }}
+.banner.warn {{ background: #fef7e0; border: 1px solid #f9ab00; }}
 .banner h1 {{ margin: 0 0 .25rem; font-size: 1.4rem; }}
 table {{ width: 100%; border-collapse: collapse; }}
 th, td {{ text-align: left; padding: .5rem .75rem; border-bottom: 1px solid #e0e0e0; vertical-align: top; }}

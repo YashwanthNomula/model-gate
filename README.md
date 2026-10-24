@@ -82,8 +82,10 @@ mgate check demo-model --config gates.json --data sample.csv --format html -o re
 | `contract` | `predict` on the first `n_rows` sample rows: output count matches input, every label ∈ `manifest.json` labels | Length mismatch or an unknown label |
 | `regression` | Current `metrics.json` vs a prior JSON report (`--baseline`): no metric regresses beyond its tolerance (direction-aware; see Baseline regression comparison) | Any metric regresses beyond tolerance, a baseline metric goes missing, or the baseline/config is malformed |
 
-Exit code: **0** if no gate fails (warnings allowed), **1** if any gate fails —
-so `mgate check ... || exit 1` gates the promotion step.
+Exit code: **0** if no *error-severity* gate fails (warnings allowed), **1** if any
+error-severity gate fails — so `mgate check ... || exit 1` gates the promotion step.
+Every gate defaults to severity `"error"`; declare `"warn"` per gate to record a
+failure without blocking (see Warning-severity gates).
 
 ## Gate overrides (exception workflow)
 
@@ -140,7 +142,8 @@ Gate a single gate subset in dev: `mgate check demo-model --config gates.json --
   "latency": {"n_calls": 10, "batch": 100, "p95_ms": 50.0},
   "size":    {"file": "model.bin", "max_bytes": 65536},
   "contract":{"n_rows": 50},
-  "overrides": {"metrics": "required justification — waives the gate, recorded as skip"}
+  "overrides": {"metrics": "required justification — waives the gate, recorded as skip"},
+  "severity": {"metrics": "warn", "latency": "warn"}
 }
 ```
 
@@ -166,6 +169,58 @@ to `higher_is_better`; an unknown direction fails the gate closed rather than
 guessing. The direction appears in every report (terminal, JSON, HTML), e.g.
 `✓ metrics pass loss 0.32 ≤ 0.5 (lower is better)`, so an audit shows which
 comparison each threshold used.
+
+### Warning-severity gates
+
+Some gates are worth tracking without blocking the promotion. Each gate can be
+declared `severity: "warn"` in the config (default `"error"`, so existing
+configs behave exactly as before):
+
+```json
+"severity": {"metrics": "warn", "latency": "warn"}
+```
+
+A failing `"warn"` gate still records status `fail` — the terminal row, JSON
+gate entry (with its `severity` field), and HTML row all show the failure
+honestly — but it does **not** fail the deployment: the overall verdict stays
+PASS and the exit code stays 0. The reports call the warnings out explicitly:
+
+- Terminal: a `WARNINGS — deployment proceeds, but these gates need attention:`
+  section after the summary (summary counts them separately, e.g.
+  `4/6 passed (1 failed, 1 warning)`).
+- JSON: a top-level `"warnings"` list of the warning gate entries.
+- HTML: a yellow `PASS (with warnings)` banner instead of the green one.
+
+`"error"` gates keep the current semantics (exit 1). For a run where you want
+everything enforced — e.g. the final prod promotion — `mgate check --strict`
+promotes all warn-severity gates to error for that run only. Unknown severity
+strings, unknown gate names, and non-object `severity` blocks are rejected
+(exit code 2): a severity that names the wrong gate is a config bug, not a pass.
+
+With `"severity": {"metrics": "warn"}` on the broken demo (where `schema` stays
+`"error"`), the warn failure is recorded but only the error failure blocks:
+
+```
+$ mgate check broken/demo-model --config broken/gates.json --data broken/sample.csv
+model-gate  artifact: demo-model
+
+  ✓ files      pass  5 required files present
+  ✗ schema     fail  missing columns: country
+  ✗ metrics    fail  below threshold: f1 0.72 < 0.8 [severity: warn]
+  ✓ latency    pass  p50 0.08ms, p95 0.14ms, p99 0.15ms over 10x100 predict calls
+  ✓ size       pass  model.bin 4.0KB (limit 64.0KB)
+  ✓ contract   pass  50 rows in, 50 labels out, all ∈ ['legit', 'fraud']
+
+4/6 passed (1 failed, 1 warning)
+
+WARNINGS — deployment proceeds, but these gates need attention:
+  ! metrics    fail  below threshold: f1 0.72 < 0.8 [severity: warn]
+$ echo $?
+1
+```
+
+Had `schema` been declared `"warn"` too, the same run would exit 0 with
+`4/6 passed (2 warning)`.
 
 ### Baseline regression comparison
 
@@ -214,14 +269,14 @@ demo-model/
 
 ```
 mgate init [--out DIR] [--broken]                 scaffold a demo (passing, or failing with --broken)
-mgate check <artifact> --config gates.json --data sample.csv [--format text|json|html] [-o file] [--only GATES...] [--override GATE=reason ...] [--baseline PRIOR-REPORT.json]
+mgate check <artifact> --config gates.json --data sample.csv [--format text|json|html] [-o file] [--only GATES...] [--override GATE=reason ...] [--baseline PRIOR-REPORT.json] [--strict]
 mgate gates                                       list available gate types
 ```
 
 ## Tests
 
 ```bash
-python3 -m pytest tests/ -q    # 70 tests
+python3 -m pytest tests/ -q    # 85 tests
 ```
 
 Pure Python, zero dependencies.

@@ -5,4 +5,4 @@ required files, schema conformance, metric thresholds, latency budget,
 artifact size, and prediction contract. Zero dependencies.
 """
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"

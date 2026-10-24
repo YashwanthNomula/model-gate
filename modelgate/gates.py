@@ -16,6 +16,11 @@ from dataclasses import dataclass
 
 PASS, FAIL, WARN, SKIP = "pass", "fail", "warn", "skip"
 
+# Per-gate severity: "error" gates block the deployment when they fail;
+# "warn" gates record the failure but let the deployment proceed (exit 0).
+SEVERITY_ERROR, SEVERITY_WARN = "error", "warn"
+VALID_SEVERITIES = frozenset({SEVERITY_ERROR, SEVERITY_WARN})
+
 HIGHER_IS_BETTER = "higher_is_better"
 LOWER_IS_BETTER = "lower_is_better"
 VALID_DIRECTIONS = frozenset({HIGHER_IS_BETTER, LOWER_IS_BETTER})
@@ -39,6 +44,9 @@ class GateResult:
     status: str
     detail: str
     duration_ms: float = 0.0
+    severity: str = SEVERITY_ERROR
+    """Gate severity: "error" blocks the deployment on failure,
+    "warn" records the failure but leaves the verdict PASS (exit 0)."""
 
     def to_dict(self):
         return {
@@ -46,6 +54,7 @@ class GateResult:
             "status": self.status,
             "detail": self.detail,
             "duration_ms": round(self.duration_ms, 2),
+            "severity": self.severity,
         }
 
 
@@ -368,17 +377,52 @@ _GATES = {
 }
 
 
-def run_gates(cfg, artifact, data_path, only=None, overrides=None):
+def parse_severities(cfg, known_gates=None):
+    """Parse the per-gate ``severity`` config block.
+
+    Returns {gate_name: "error"|"warn"}. Gates absent from the block keep
+    the default severity "error", preserving current behavior.
+    Raises ValueError on anything malformed — a severity naming an
+    unknown gate, or an unknown severity string, fails closed: a
+    silently-ignored severity would misreport the deployment verdict.
+    """
+    block = cfg.get("severity", {}) or {}
+    if not isinstance(block, dict):
+        raise ValueError(
+            "'severity' config block must be an object mapping gate -> 'error'|'warn'"
+        )
+    known = set(known_gates) if known_gates is not None else set(_GATES) | {"regression"}
+    out = {}
+    for name, sev in block.items():
+        if name not in known:
+            raise ValueError(f"severity for unknown gate '{name}'")
+        if not isinstance(sev, str) or sev not in VALID_SEVERITIES:
+            raise ValueError(
+                f"severity for gate '{name}': invalid severity '{sev}' "
+                "(expected 'error' or 'warn')"
+            )
+        out[name] = sev
+    return out
+
+
+def run_gates(cfg, artifact, data_path, only=None, overrides=None, severities=None):
     """Run the configured gates (or the `only` subset) and return GateResults.
 
     Gates listed in `overrides` are waived: they are not executed and
     return a skip result carrying the justification string, so the
     waiver is recorded in every report format.
+
+    `severities` is the {gate: "error"|"warn"} map from parse_severities
+    (parsed from cfg when omitted); each result is stamped with its
+    gate's severity so the exit code and reports can tell a blocking
+    failure from a recorded warning.
     """
     wanted = list(only) if only is not None else list(cfg.get("gates", _GATES))
     overrides = overrides or {}
+    sev = severities if severities is not None else parse_severities(cfg)
     results = []
     for name in wanted:
+        gate_sev = sev.get(name, SEVERITY_ERROR)
         if name in overrides:
             results.append(
                 GateResult(
@@ -386,16 +430,20 @@ def run_gates(cfg, artifact, data_path, only=None, overrides=None):
                     SKIP,
                     f"waived by override: {overrides[name]}",
                     0.0,
+                    severity=gate_sev,
                 )
             )
             continue
         fn = _GATES.get(name)
         if fn is None:
             results.append(
-                GateResult(name, SKIP, f"unknown gate '{name}'", 0.0)
+                GateResult(name, SKIP, f"unknown gate '{name}'", 0.0,
+                           severity=gate_sev)
             )
             continue
-        results.append(fn(cfg, artifact, data_path))
+        result = fn(cfg, artifact, data_path)
+        result.severity = gate_sev
+        results.append(result)
     return results
 
 
@@ -418,5 +466,12 @@ def resolve_overrides(cfg, cli_overrides=None):
 
 
 def exit_code(results):
-    """0 if no failures (warnings allowed), 1 if any gate failed."""
-    return 1 if any(r.status == FAIL for r in results) else 0
+    """Exit 0 unless an *error-severity* gate failed.
+
+    A failing "warn"-severity gate is recorded (status "fail" stays in
+    the report) but does not block the deployment; a "warn" status
+    result was already non-blocking. Anything else (a severity that is
+    not "warn") fails the run closed.
+    """
+    return 1 if any(r.status == FAIL and r.severity != SEVERITY_WARN
+                    for r in results) else 0

@@ -19,6 +19,7 @@ from modelgate.gates import (
     gate_metrics,
     gate_schema,
     gate_size,
+    parse_severities,
     resolve_overrides,
     run_gates,
 )
@@ -280,7 +281,8 @@ def test_json_report_shape(passing):
     assert payload["summary"]["total"] == 6
     assert payload["summary"]["pass"] == 6
     gate = payload["gates"][0]
-    assert set(gate) == {"name", "status", "detail", "duration_ms"}
+    assert set(gate) == {"name", "status", "detail", "duration_ms", "severity"}
+    assert gate["severity"] == "error"  # default severity is recorded, not implied
 
 
 def test_render_dict_has_all_status_keys(passing):
@@ -769,3 +771,166 @@ def test_check_command_with_directions_end_to_end(passing):
     code = main(["check", passing["artifact"], "--config", config_path,
                  "--data", passing["sample"]])
     assert code == 1  # loss over threshold fails the run
+
+
+# ---- warning-severity gates ------------------------------------------------
+
+def _warn_cfg(passing, metrics_cfg=None, metrics_values=None, severity=None):
+    """Passing-demo config with a metrics gate that fails + a severity block."""
+    cfg = dict(passing["cfg"])
+    cfg["metrics"] = metrics_cfg or {"accuracy": 0.9, "f1": 0.8, "auc": 0.9}
+    with open(os.path.join(passing["artifact"], "metrics.json"), "w") as f:
+        json.dump(metrics_values or
+                  {"accuracy": 0.93, "f1": 0.50, "auc": 0.95}, f)  # f1 breaches
+    cfg["severity"] = severity if severity is not None else {"metrics": "warn"}
+    return cfg
+
+
+def test_warn_severity_failure_records_fail_but_exits_0(passing):
+    """A warn-severity gate failure is recorded honestly but does not block."""
+    cfg = _warn_cfg(passing)
+    results = run_gates(cfg, passing["artifact"], passing["sample"])
+    by_name = {r.name: r for r in results}
+    assert by_name["metrics"].status == "fail"  # still FAIL in the record
+    assert by_name["metrics"].severity == "warn"
+    assert exit_code(results) == 0  # deployment proceeds
+    from modelgate.report import summary_line
+    assert summary_line(results) == "5/6 passed (1 warning)"
+
+
+def test_default_severity_error_still_blocks(passing):
+    """No severity block: identical failure keeps the old blocking behavior."""
+    cfg = _warn_cfg(passing, severity={})
+    results = run_gates(cfg, passing["artifact"], passing["sample"])
+    by_name = {r.name: r for r in results}
+    assert by_name["metrics"].severity == "error"
+    assert exit_code(results) == 1
+    from modelgate.report import summary_line
+    assert summary_line(results) == "5/6 passed (1 failed)"
+
+
+def test_mixed_severities_error_failure_blocks(passing):
+    """An error-severity failure blocks even alongside a warn failure."""
+    cfg = _warn_cfg(passing)
+    cfg["size"] = {"file": "model.bin", "max_bytes": 10}  # size (error) fails too
+    results = run_gates(cfg, passing["artifact"], passing["sample"])
+    by_name = {r.name: r for r in results}
+    assert by_name["size"].severity == "error"
+    assert by_name["metrics"].severity == "warn"
+    assert exit_code(results) == 1
+    from modelgate.report import summary_line
+    assert summary_line(results) == "4/6 passed (1 failed, 1 warning)"
+
+
+def test_severity_unknown_string_fails_closed(passing):
+    cfg = dict(passing["cfg"])
+    cfg["severity"] = {"metrics": "critical"}
+    with pytest.raises(ValueError, match="invalid severity"):
+        run_gates(cfg, passing["artifact"], passing["sample"])
+
+
+def test_severity_unknown_gate_fails_closed(passing):
+    cfg = dict(passing["cfg"])
+    cfg["severity"] = {"not-a-gate": "warn"}
+    with pytest.raises(ValueError, match="unknown gate"):
+        run_gates(cfg, passing["artifact"], passing["sample"])
+
+
+def test_severity_block_must_be_object(passing):
+    cfg = dict(passing["cfg"])
+    cfg["severity"] = ["metrics"]
+    with pytest.raises(ValueError, match="must be an object"):
+        run_gates(cfg, passing["artifact"], passing["sample"])
+
+
+def test_parse_severities_defaults_and_known_gates():
+    assert parse_severities({}) == {}
+    assert parse_severities({"severity": {"metrics": "warn"}}) == {"metrics": "warn"}
+    # "regression" is not in run_gates' table but is a valid severity target
+    assert parse_severities({"severity": {"regression": "warn"}}) == {
+        "regression": "warn"}
+    assert parse_severities({"severity": {"metrics": "error"}}) == {"metrics": "error"}
+
+
+def test_check_warn_severity_exit_0_terminal_section(broken, tmp_path, capsys):
+    """End-to-end: warn-severity failures exit 0 with a WARNINGS section."""
+    cfg = dict(broken["cfg"])
+    cfg["severity"] = {"schema": "warn", "metrics": "warn"}
+    config_path = _write_cfg(tmp_path, cfg, "warn_gates.json")
+    code = main(["check", broken["artifact"], "--config", config_path,
+                 "--data", broken["sample"]])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "4/6 passed (2 warning)" in out
+    assert "WARNINGS" in out
+    assert "severity: warn" in out
+
+
+def test_check_strict_promotes_warn_to_error(broken, tmp_path):
+    """--strict: every warn-severity failure blocks the deployment."""
+    cfg = dict(broken["cfg"])
+    cfg["severity"] = {"schema": "warn", "metrics": "warn"}
+    config_path = _write_cfg(tmp_path, cfg, "warn_gates.json")
+    code = main(["check", broken["artifact"], "--config", config_path,
+                 "--data", broken["sample"], "--strict"])
+    assert code == 1
+
+
+def test_check_malformed_severity_exit_2(broken, tmp_path):
+    cfg = dict(broken["cfg"])
+    cfg["severity"] = {"metrics": "critical"}
+    config_path = _write_cfg(tmp_path, cfg, "badsev.json")
+    code = main(["check", broken["artifact"], "--config", config_path,
+                 "--data", broken["sample"]])
+    assert code == 2
+
+
+def test_check_strict_still_rejects_malformed_severity(broken, tmp_path):
+    """--strict promotes warn gates, but a bad severity block still fails closed."""
+    cfg = dict(broken["cfg"])
+    cfg["severity"] = {"metrics": "critical"}
+    config_path = _write_cfg(tmp_path, cfg, "badsev.json")
+    code = main(["check", broken["artifact"], "--config", config_path,
+                 "--data", broken["sample"], "--strict"])
+    assert code == 2
+
+
+def test_json_report_warnings_list_and_severity_keys(passing):
+    cfg = _warn_cfg(passing)
+    results = run_gates(cfg, passing["artifact"], passing["sample"])
+    payload = json.loads(render_json(results, "demo-model"))
+    assert [g["name"] for g in payload["warnings"]] == ["metrics"]
+    gate = next(g for g in payload["gates"] if g["name"] == "metrics")
+    assert gate["status"] == "fail"
+    assert gate["severity"] == "warn"
+    assert payload["summary"]["fail"] == 1  # status counted honestly
+
+
+def test_html_warn_banner(passing):
+    cfg = _warn_cfg(passing)
+    results = run_gates(cfg, passing["artifact"], passing["sample"])
+    page = render_html(results, "demo-model")
+    assert "model-gate: PASS (with warnings)" in page
+    assert 'class="banner warn"' in page
+    assert "[severity: warn]" in page
+
+
+def test_html_fail_banner_unchanged(broken):
+    """Error-severity failures keep the red FAIL banner."""
+    results = run_gates(broken["cfg"], broken["artifact"], broken["sample"])
+    page = render_html(results, "demo-model")
+    assert "model-gate: FAIL" in page
+    assert 'class="banner bad"' in page
+
+
+def test_regression_gate_honours_warn_severity(passing, tmp_path):
+    """A warn-severity regression failure records FAIL but exits 0."""
+    baseline = _baseline_report(
+        tmp_path, {"accuracy": 0.99, "f1": 0.88, "auc": 0.95})
+    cfg = _regression_cfg(passing, {"default_tolerance": 0.02})
+    cfg["severity"] = {"regression": "warn"}
+    r = gate_regression(cfg, passing["artifact"], passing["sample"], baseline)
+    assert r.status == "fail"
+    assert "REGRESSED" in r.detail
+    assert r.severity == "warn"
+    assert exit_code([r]) == 0
