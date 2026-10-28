@@ -405,6 +405,42 @@ def parse_severities(cfg, known_gates=None):
     return out
 
 
+KNOWN_GATES = frozenset(_GATES) | {"regression"}
+
+
+def validate_gate_selection(cfg, only):
+    """Fail closed on gate-selection typos.
+
+    A misspelled gate name in `--only` (or in the config `gates` list)
+    must not silently skip that gate and report a pass: today
+    `run_gates` records an unknown name as `skip`, so
+    `mgate check ... --only schem` would exit 0 having checked
+    nothing. Raises ValueError naming the unknown gate(s); an empty
+    selection is likewise rejected — `0/0 passed` is not a pass.
+    """
+    if only is not None:
+        if not only:
+            raise ValueError("--only needs at least one gate name")
+        unknown = [g for g in only if g not in KNOWN_GATES]
+        if unknown:
+            raise ValueError(
+                f"unknown gate(s) in --only: {', '.join(unknown)} "
+                f"(known gates: {', '.join(sorted(KNOWN_GATES))})"
+            )
+        return
+    names = cfg.get("gates", list(_GATES))
+    if not isinstance(names, list):
+        raise ValueError("'gates' config must be a list of gate names")
+    if not names:
+        raise ValueError("'gates' config must list at least one gate")
+    unknown = [g for g in names if g not in KNOWN_GATES]
+    if unknown:
+        raise ValueError(
+            f"unknown gate(s) in config 'gates': {', '.join(unknown)} "
+            f"(known gates: {', '.join(sorted(KNOWN_GATES))})"
+        )
+
+
 def run_gates(cfg, artifact, data_path, only=None, overrides=None, severities=None):
     """Run the configured gates (or the `only` subset) and return GateResults.
 

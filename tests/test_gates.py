@@ -934,3 +934,65 @@ def test_regression_gate_honours_warn_severity(passing, tmp_path):
     assert "REGRESSED" in r.detail
     assert r.severity == "warn"
     assert exit_code([r]) == 0
+
+
+# ---- fail-closed gate selection ----------------------------------------
+
+def test_only_unknown_gate_rejected(passing, tmp_path, capsys):
+    """A typo in --only must not silently skip the gate and exit 0."""
+    code = main(["check", passing["artifact"], "--config", _write_cfg(tmp_path, passing["cfg"]),
+                 "--data", passing["sample"], "--only", "schem"])
+    assert code == 2
+    assert "unknown gate" in capsys.readouterr().err
+
+
+def test_only_empty_rejected(passing, tmp_path):
+    """--only with no gate names is not a 0/0 pass."""
+    code = main(["check", passing["artifact"], "--config", _write_cfg(tmp_path, passing["cfg"]),
+                 "--data", passing["sample"], "--only"])
+    assert code == 2
+
+
+def test_config_gates_unknown_gate_rejected(passing, tmp_path, capsys):
+    cfg = dict(passing["cfg"])
+    cfg["gates"] = ["files", "schem"]
+    code = main(["check", passing["artifact"], "--config", _write_cfg(tmp_path, cfg),
+                 "--data", passing["sample"]])
+    assert code == 2
+    assert "unknown gate" in capsys.readouterr().err
+
+
+def test_config_gates_empty_rejected(passing, tmp_path):
+    cfg = dict(passing["cfg"])
+    cfg["gates"] = []
+    code = main(["check", passing["artifact"], "--config", _write_cfg(tmp_path, cfg),
+                 "--data", passing["sample"]])
+    assert code == 2
+
+
+def test_config_gates_non_list_rejected(passing, tmp_path):
+    cfg = dict(passing["cfg"])
+    cfg["gates"] = "schema"
+    code = main(["check", passing["artifact"], "--config", _write_cfg(tmp_path, cfg),
+                 "--data", passing["sample"]])
+    assert code == 2
+
+
+def test_only_regression_still_allowed(passing, tmp_path):
+    """'regression' is a known gate name for selection purposes."""
+    cfg = _regression_cfg(passing, {"default_tolerance": 0.02})
+    code = main(["check", passing["artifact"], "--config", _write_cfg(tmp_path, cfg),
+                 "--data", passing["sample"], "--only", "regression"])
+    assert code == 1  # needs --baseline; rejected names would give 2
+
+
+def test_validate_gate_selection_unit():
+    from modelgate.gates import validate_gate_selection
+    validate_gate_selection({"gates": ["files", "schema"]}, None)
+    validate_gate_selection({}, ["schema", "regression"])
+    with pytest.raises(ValueError, match="unknown gate"):
+        validate_gate_selection({}, ["schem"])
+    with pytest.raises(ValueError, match="at least one gate"):
+        validate_gate_selection({}, [])
+    with pytest.raises(ValueError, match="at least one gate"):
+        validate_gate_selection({"gates": []}, None)

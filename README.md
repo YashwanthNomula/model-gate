@@ -131,6 +131,10 @@ Overrides for unknown gates or with an empty justification are rejected
 
 Gate a single gate subset in dev: `mgate check demo-model --config gates.json --data sample.csv --only schema metrics`.
 
+Gate selection fails closed: an unknown name in `--only` (or in the config
+`gates` list), and an empty selection, are rejected with exit code 2 — a
+typo like `--only schem` must never report a pass for gates that never ran.
+
 ## Config reference (`gates.json`)
 
 ```json
@@ -276,7 +280,7 @@ mgate gates                                       list available gate types
 ## Tests
 
 ```bash
-python3 -m pytest tests/ -q    # 85 tests
+python3 -m pytest tests/ -q    # 92 tests
 ```
 
 Pure Python, zero dependencies.

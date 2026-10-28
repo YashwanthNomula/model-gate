@@ -17,6 +17,7 @@ from modelgate.gates import (
     parse_severities,
     resolve_overrides,
     run_gates,
+    validate_gate_selection,
 )
 from modelgate.report import render_html, render_json, render_text
 
@@ -69,6 +70,12 @@ def cmd_check(args):
             cfg = json.load(f)
     except json.JSONDecodeError as exc:
         print(f"error: invalid JSON in {args.config}: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        validate_gate_selection(cfg, args.only)
+    except ValueError as exc:
+        print(f"error: invalid gate selection: {exc}", file=sys.stderr)
         return 2
 
     try:
